@@ -1,0 +1,163 @@
+#!/usr/bin/env sh
+# Verify that gentoo-mirror checkout(s) are GPG-signed correctly.
+# (c) 2016 Michał Górny, 2-clause BSD licensed
+
+RED=$(printf "\033[31m")
+GREEN=$(printf "\033[32m")
+BROWN=$(printf "\033[33m")
+CYAN=$(printf "\033[36m")
+BOLD=$(printf "\033[1m")
+RESET=$(printf "\033[0m")
+
+try_commit() {
+	# rev passes through and is used for return value
+	local attempt signed p parents
+	attempt=0
+
+	while [ ${#} -gt 0 ]; do
+		rev=${1}
+		shift
+
+		signed=$(git show -q --pretty=format:'%G?' "${rev}")
+		[ ${?} -eq 0 ] || return 2
+		case ${signed} in
+			G)
+				echo "${GREEN}Good signature on ${rev}${RESET}"
+				return 0
+				;;
+			U)
+				echo "${BROWN}Untrusted signature on ${rev}${RESET}"
+				echo "${BROWN}(you may need to import/trust developer keys)${RESET}"
+				return 0
+				;;
+			B)
+				echo "${RED}Bad signature on HEAD${RESET}"
+				return 1
+				;;
+			N)
+				# no signature? try the next commit
+				attempt=$((attempt + 1))
+				[[ ${attempt} == 10 ]] && return 3
+
+				parents=$(git show -q --pretty=format:'%P' "${rev}")
+				[ ${?} -eq 0 ] || return 2
+
+				# append parents to the end and iterate
+				# (this ensures we travel branches in parallel)
+				set -- "${@}" ${parents}
+				;;
+			*)
+				echo "${BROWN}Unknown signature status '${signed}' (report a bug)${RESET}"
+				return 2
+				;;
+		esac
+	done
+}
+
+verify_repo() {
+	local diff rev
+
+	echo "[${BOLD}${1}${RESET}]"
+	cd "${1}" || exit 1
+
+	if ! [ -d .git ]; then
+		echo "${BROWN}Not a git repository, unable to verify${RESET}"
+		exit 2
+	fi
+
+	rev=$(git rev-parse HEAD)
+	[ ${?} -eq 0 ] || exit 2
+
+	try_commit "${rev}"
+	case ${?} in
+		0) # found a signature
+			# pass-through
+			;;
+		1|2) # bad signature / error
+			exit ${?}
+			;;
+		3) # no signature on recent commits
+			echo "${BROWN}No signature found on recent commits${RESET}"
+			exit 3
+			;;
+	esac
+
+	diff=$(git diff --name-only ${rev}..HEAD)
+	if [ -z "${diff}" ]; then
+		# No differences? Cool.
+		:
+	elif [ -z "$( echo "${diff}" | grep -v ^metadata/ | grep -v '^profiles/use.local.desc$' )" ]; then
+		# Metadata differs? Relatively cool.
+		echo "${CYAN}Note: unsigned changes in metadata and/or caches found (it's fine)${RESET}"
+	else
+		echo "${RED}Unsigned changes in the repository found since signed commit${RESET}"
+		exit 1
+	fi
+}
+
+pmq() {
+	# A quick wrap-command over PM interfaces
+	if type -P gentoopmq >/dev/null 2>&1; then
+		gentoopmq "${@}"
+	elif type -P portageq >/dev/null 2>&1; then
+		case ${1} in
+			repositories)
+				portageq get_repos "${ROOT:-/}"
+				;;
+			repo-path)
+				portageq get_repo_path "${2}" "${ROOT:-/}"
+				;;
+		esac
+	else
+		echo "No Package Manager front-end (gentoopmq, portageq) found!" >&2
+		exit 1
+	fi
+}
+
+main() {
+	local verified_any path repo repos
+	verified_any=
+
+	while [ ${#} -ge 1 ]; do
+		case ${1} in
+			--help|-*)
+				echo "Usage: ${0} [<repository>...]"
+				echo
+				echo "<repository> -- repository name or path to verify"
+				echo "                (default: all installed repos)"
+				# set exit status
+				[ ${1} == --help ]
+				exit
+				;;
+			--version)
+				echo "verify-repo-mirror 0"
+				exit 0
+				;;
+			/*) # path
+				verify_repo "${1}"
+				verified_any=1
+				;;
+			*) # name?
+				path=$(pmq repo-path "${1}")
+				[ ${?} -eq 0 ] || exit 1
+				( verify_repo "${path}" )
+				verified_any=1
+				;;
+		esac
+
+		shift
+	done
+
+	if [ -z "${verified_any}" ]; then
+		repos=$(pmq repositories)
+		[ ${?} -eq 0 ] || exit 1
+
+		for repo in ${repos}; do
+			path=$(pmq repo-path "${repo}")
+			[ ${?} -eq 0 ] || exit 1
+			( verify_repo "${path}" )
+		done
+	fi
+}
+
+main "${@}"
